@@ -19,8 +19,8 @@ st.set_page_config(
 # Custom colors
 # ---------------------------------
 COLOR_MAP = {
-    "REAL": "#2A9D8F",   # teal
-    "FAKE": "#E9C46A",   # warm gold
+    "REAL": "#2A9D8F",
+    "FAKE": "#E9C46A",
 }
 
 ACCENT_GREEN = "#6BA292"
@@ -72,7 +72,6 @@ def make_metric_table(df):
         "repeated_word_ratio",
         "sentence_complexity",
         "punctuation_density",
-        "bert_over_512_words",
     ]
     existing_metric_cols = [col for col in metric_cols if col in df.columns]
 
@@ -99,16 +98,70 @@ def make_metric_table(df):
     return summary
 
 
+def stratified_sample(df, label_col, max_rows, random_state=42):
+    if df.empty or label_col not in df.columns:
+        return df.copy()
+
+    n_classes = df[label_col].nunique()
+    if n_classes == 0 or len(df) <= max_rows:
+        return df.copy()
+
+    per_class = max(max_rows // n_classes, 1)
+    sampled_parts = []
+
+    for label in sorted(df[label_col].dropna().unique()):
+        subset = df[df[label_col] == label]
+        sampled_parts.append(subset.sample(min(len(subset), per_class), random_state=random_state))
+
+    sampled = pd.concat(sampled_parts, ignore_index=True)
+
+    if len(sampled) > max_rows:
+        sampled = sampled.sample(max_rows, random_state=random_state).reset_index(drop=True)
+
+    return sampled
+
+
+def safe_plot_df(df, needed_cols):
+    existing = [col for col in needed_cols if col in df.columns]
+    if len(existing) != len(needed_cols):
+        return pd.DataFrame(columns=needed_cols)
+
+    plot_df = df[needed_cols].copy()
+
+    numeric_candidates = [
+        "title_word_count",
+        "text_word_count",
+        "char_count",
+        "title_caps_ratio",
+        "title_punct_density",
+        "lexical_diversity",
+        "stopword_ratio",
+        "repeated_word_ratio",
+        "sentence_complexity",
+        "punctuation_density",
+        "percent_over_512",
+        "count",
+        "percent",
+    ]
+
+    for col in numeric_candidates:
+        if col in plot_df.columns:
+            plot_df[col] = pd.to_numeric(plot_df[col], errors="coerce")
+
+    plot_df = plot_df.dropna()
+    return plot_df
+
+
 # -----------------------------
 # Load WELFake split files
 # -----------------------------
 @st.cache_data
 def load_welfake_parts():
     search_patterns = [
-         "WELFake_part_*.csv",
-    os.path.join("data", "WELFake_part_*.csv"),
-    os.path.join("WELFake_split_parts", "WELFake_part_*.csv"),
-    os.path.join("WELFake_split_parts_pandas", "WELFake_part_*.csv"),  # ✅ THIS IS YOUR FOLDER
+        "WELFake_part_*.csv",
+        os.path.join("data", "WELFake_part_*.csv"),
+        os.path.join("WELFake_split_parts", "WELFake_part_*.csv"),
+        os.path.join("WELFake_split_parts_pandas", "WELFake_part_*.csv"),
     ]
 
     file_paths = []
@@ -126,7 +179,8 @@ def load_welfake_parts():
             "Put the split files either:\n"
             "- in the same folder as RealvFake.py\n"
             "- in a folder named data\n"
-            "- in a folder named WELFake_split_parts"
+            "- in a folder named WELFake_split_parts\n"
+            "- in a folder named WELFake_split_parts_pandas"
         )
 
     frames = []
@@ -142,6 +196,9 @@ def load_welfake_parts():
         return None, "No WELFake files could be loaded."
 
     df = pd.concat(frames, ignore_index=True, sort=False)
+
+    # Remove duplicate columns if any appeared during concat
+    df = df.loc[:, ~df.columns.duplicated()].copy()
 
     unnamed_cols = [col for col in df.columns if str(col).startswith("Unnamed")]
     if unnamed_cols:
@@ -223,6 +280,22 @@ def load_welfake_parts():
     df["repeated_word_ratio"] = df["text_clean"].apply(repeated_word_ratio)
     df["sentence_complexity"] = df["text_clean"].apply(sentence_complexity)
     df["punctuation_density"] = df["text_clean"].apply(punctuation_density)
+
+    # Force numeric columns to be safe for deployment plotting
+    numeric_cols = [
+        "title_word_count",
+        "text_word_count",
+        "char_count",
+        "title_caps_ratio",
+        "title_punct_density",
+        "lexical_diversity",
+        "stopword_ratio",
+        "repeated_word_ratio",
+        "sentence_complexity",
+        "punctuation_density",
+    ]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Title signal flags
     df["has_question_mark_title"] = df["title_clean"].str.contains(r"\?", regex=True, na=False)
@@ -314,14 +387,7 @@ elif bert_filter == "512 words or fewer":
     filtered = filtered[~filtered["bert_over_512_words"]].copy()
 
 # Live-chart downsampling for performance
-chart_df = filtered.copy()
-if len(chart_df) > sample_size and chart_df["label_name"].nunique() > 0:
-    per_class = max(sample_size // chart_df["label_name"].nunique(), 1)
-    chart_df = (
-        chart_df.groupby("label_name", group_keys=False)
-        .apply(lambda x: x.sample(min(len(x), per_class), random_state=42))
-        .reset_index(drop=True)
-    )
+chart_df = stratified_sample(filtered, "label_name", sample_size, random_state=42)
 
 # Balanced analysis set
 if balance_view and filtered["label_name"].nunique() == 2:
@@ -377,17 +443,22 @@ with tab1:
             .reset_index(name="count")
         )
 
-        fig = px.bar(
-            counts_df,
-            x="label_name",
-            y="count",
-            text="count",
-            color="label_name",
-            color_discrete_map=COLOR_MAP,
-            title="Class balance in the filtered view",
-        )
-        fig.update_traces(textposition="outside")
-        st.plotly_chart(fig, use_container_width=True)
+        counts_plot = safe_plot_df(counts_df, ["label_name", "count"])
+
+        if not counts_plot.empty:
+            fig = px.bar(
+                counts_plot,
+                x="label_name",
+                y="count",
+                text="count",
+                color="label_name",
+                color_discrete_map=COLOR_MAP,
+                title="Class balance in the filtered view",
+            )
+            fig.update_traces(textposition="outside")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Class balance chart could not be rendered for the current filter.")
 
     with right:
         summary_tbl = make_metric_table(analysis_df)
@@ -439,28 +510,36 @@ with tab2:
         left, right = st.columns(2)
 
         with left:
-            fig = px.histogram(
-                chart_df,
-                x="text_word_count",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                barmode="overlay",
-                nbins=40,
-                marginal="box",
-                title="Distribution of article text length",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            hist_df = safe_plot_df(chart_df, ["text_word_count", "label_name"])
+            if not hist_df.empty:
+                fig = px.histogram(
+                    hist_df,
+                    x="text_word_count",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    barmode="overlay",
+                    nbins=40,
+                    marginal="box",
+                    title="Distribution of article text length",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Text length histogram could not be rendered.")
 
-            fig2 = px.box(
-                analysis_df,
-                x="label_name",
-                y="sentence_complexity",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Sentence complexity by class",
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+            complexity_df = safe_plot_df(analysis_df, ["label_name", "sentence_complexity"])
+            if not complexity_df.empty:
+                fig2 = px.box(
+                    complexity_df,
+                    x="label_name",
+                    y="sentence_complexity",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Sentence complexity by class",
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.warning("Sentence complexity plot could not be rendered.")
 
         with right:
             bert_df = (
@@ -470,29 +549,38 @@ with tab2:
                 .round(1)
                 .reset_index(name="percent_over_512")
             )
-            fig3 = px.bar(
-                bert_df,
-                x="label_name",
-                y="percent_over_512",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                title="Percent of articles over 512 words",
-                text="percent_over_512",
-            )
-            fig3.update_traces(texttemplate="%{text}%", textposition="outside")
-            st.plotly_chart(fig3, use_container_width=True)
+            bert_plot = safe_plot_df(bert_df, ["label_name", "percent_over_512"])
 
-            fig4 = px.scatter(
-                chart_df,
-                x="text_word_count",
-                y="char_count",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                opacity=0.65,
-                hover_data=["title_clean"],
-                title="Text words vs character count",
-            )
-            st.plotly_chart(fig4, use_container_width=True)
+            if not bert_plot.empty:
+                fig3 = px.bar(
+                    bert_plot,
+                    x="label_name",
+                    y="percent_over_512",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    title="Percent of articles over 512 words",
+                    text="percent_over_512",
+                )
+                fig3.update_traces(texttemplate="%{text}%", textposition="outside")
+                st.plotly_chart(fig3, use_container_width=True)
+            else:
+                st.warning("BERT pressure chart could not be rendered.")
+
+            char_df = safe_plot_df(chart_df, ["text_word_count", "char_count", "label_name", "title_clean"])
+            if not char_df.empty:
+                fig4 = px.scatter(
+                    char_df,
+                    x="text_word_count",
+                    y="char_count",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    opacity=0.65,
+                    hover_data=["title_clean"],
+                    title="Text words vs character count",
+                )
+                st.plotly_chart(fig4, use_container_width=True)
+            else:
+                st.warning("Character count scatterplot could not be rendered.")
 
 with tab3:
     st.subheader("Language signals")
@@ -503,62 +591,82 @@ with tab3:
         l1, l2 = st.columns(2)
 
         with l1:
-            fig = px.box(
-                analysis_df,
-                x="label_name",
+            lex_df = safe_plot_df(analysis_df, ["label_name", "lexical_diversity"])
+            if not lex_df.empty:
+                fig = px.box(
+                    lex_df,
+                    x="label_name",
+                    y="lexical_diversity",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Lexical diversity",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Lexical diversity plot could not be rendered.")
+
+            rep_df = safe_plot_df(analysis_df, ["label_name", "repeated_word_ratio"])
+            if not rep_df.empty:
+                fig = px.box(
+                    rep_df,
+                    x="label_name",
+                    y="repeated_word_ratio",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Repeated word ratio",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Repeated word ratio plot could not be rendered.")
+
+        with l2:
+            stop_df = safe_plot_df(analysis_df, ["label_name", "stopword_ratio"])
+            if not stop_df.empty:
+                fig = px.box(
+                    stop_df,
+                    x="label_name",
+                    y="stopword_ratio",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Stopword ratio",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Stopword ratio plot could not be rendered.")
+
+            punct_df = safe_plot_df(analysis_df, ["label_name", "punctuation_density"])
+            if not punct_df.empty:
+                fig = px.box(
+                    punct_df,
+                    x="label_name",
+                    y="punctuation_density",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Punctuation density",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Punctuation density plot could not be rendered.")
+
+        scatter_df = safe_plot_df(chart_df, ["text_word_count", "lexical_diversity", "label_name", "title_clean"])
+        if not scatter_df.empty:
+            fig = px.scatter(
+                scatter_df,
+                x="text_word_count",
                 y="lexical_diversity",
                 color="label_name",
                 color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Lexical diversity",
+                opacity=0.7,
+                hover_data=["title_clean"],
+                title="Article length vs lexical diversity",
             )
             st.plotly_chart(fig, use_container_width=True)
-
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="repeated_word_ratio",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Repeated word ratio",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with l2:
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="stopword_ratio",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Stopword ratio",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="punctuation_density",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Punctuation density",
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        fig = px.scatter(
-            chart_df,
-            x="text_word_count",
-            y="lexical_diversity",
-            color="label_name",
-            color_discrete_map=COLOR_MAP,
-            opacity=0.7,
-            hover_data=["title_clean"],
-            title="Article length vs lexical diversity",
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.warning("Lexical diversity scatterplot could not be rendered.")
 
 with tab4:
     st.subheader("Headline signals")
@@ -569,27 +677,35 @@ with tab4:
         h1, h2 = st.columns(2)
 
         with h1:
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="title_word_count",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Headline word count",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            title_wc_df = safe_plot_df(analysis_df, ["label_name", "title_word_count"])
+            if not title_wc_df.empty:
+                fig = px.box(
+                    title_wc_df,
+                    x="label_name",
+                    y="title_word_count",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Headline word count",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Headline word count plot could not be rendered.")
 
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="title_caps_ratio",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Headline capitalization ratio",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            title_caps_df = safe_plot_df(analysis_df, ["label_name", "title_caps_ratio"])
+            if not title_caps_df.empty:
+                fig = px.box(
+                    title_caps_df,
+                    x="label_name",
+                    y="title_caps_ratio",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Headline capitalization ratio",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Headline capitalization plot could not be rendered.")
 
         with h2:
             title_flags = (
@@ -608,27 +724,35 @@ with tab4:
             }
             title_flags["signal"] = title_flags["signal"].map(pretty_map)
 
-            fig = px.bar(
-                title_flags,
-                x="signal",
-                y="percent",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                barmode="group",
-                title="Share of titles with strong headline signals",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            title_flags_plot = safe_plot_df(title_flags, ["label_name", "signal", "percent"])
+            if not title_flags_plot.empty:
+                fig = px.bar(
+                    title_flags_plot,
+                    x="signal",
+                    y="percent",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    barmode="group",
+                    title="Share of titles with strong headline signals",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Headline signal bar chart could not be rendered.")
 
-            fig = px.box(
-                analysis_df,
-                x="label_name",
-                y="title_punct_density",
-                color="label_name",
-                color_discrete_map=COLOR_MAP,
-                points="all",
-                title="Headline punctuation density",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            title_punct_df = safe_plot_df(analysis_df, ["label_name", "title_punct_density"])
+            if not title_punct_df.empty:
+                fig = px.box(
+                    title_punct_df,
+                    x="label_name",
+                    y="title_punct_density",
+                    color="label_name",
+                    color_discrete_map=COLOR_MAP,
+                    points="all",
+                    title="Headline punctuation density",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Headline punctuation density plot could not be rendered.")
 
 with tab5:
     st.subheader("Term explorer")
