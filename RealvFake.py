@@ -1,4 +1,3 @@
-import glob
 import os
 import re
 from collections import Counter
@@ -153,135 +152,41 @@ def safe_plot_df(df, needed_cols):
 
 
 # -----------------------------
-# Load WELFake split files
+# Load processed deployment file
 # -----------------------------
 @st.cache_data
-def load_welfake_parts():
-    search_patterns = [
-        "WELFake_part_*.csv",
-        os.path.join("data", "WELFake_part_*.csv"),
-        os.path.join("WELFake_split_parts", "WELFake_part_*.csv"),
-        os.path.join("WELFake_split_parts_pandas", "WELFake_part_*.csv"),
-    ]
+def load_data():
+    file_path = "welfake_deploy.parquet"
 
-    file_paths = []
-    for pattern in search_patterns:
-        file_paths.extend(glob.glob(pattern))
-
-    file_paths = sorted(list(set(file_paths)))
-
-    if not file_paths:
-        searched = "\n".join(search_patterns)
+    if not os.path.exists(file_path):
         return None, (
-            "No split WELFake files were found.\n\n"
-            "The app searched these locations:\n"
-            f"{searched}\n\n"
-            "Put the split files either:\n"
-            "- in the same folder as RealvFake.py\n"
-            "- in a folder named data\n"
-            "- in a folder named WELFake_split_parts\n"
-            "- in a folder named WELFake_split_parts_pandas"
+            "Could not find `welfake_deploy.parquet`. "
+            "Keep it in the same folder as `RealvFake.py`."
         )
 
-    frames = []
-    failed_files = []
+    try:
+        df = pd.read_parquet(file_path)
+    except Exception as e:
+        return None, f"Error loading parquet file: {e}"
 
-    for path in file_paths:
-        try:
-            frames.append(pd.read_csv(path))
-        except Exception as e:
-            failed_files.append(f"{os.path.basename(path)}: {e}")
-
-    if not frames:
-        return None, "No WELFake files could be loaded."
-
-    df = pd.concat(frames, ignore_index=True, sort=False)
-
-    # Remove duplicate columns if any appeared during concat
+    # Safety cleanup
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    unnamed_cols = [col for col in df.columns if str(col).startswith("Unnamed")]
-    if unnamed_cols:
-        df = df.drop(columns=unnamed_cols)
+    # Ensure expected string columns exist
+    if "title_clean" in df.columns:
+        df["title_clean"] = df["title_clean"].fillna("").astype(str)
+    else:
+        df["title_clean"] = ""
 
-    if "label" not in df.columns:
-        return None, "The combined WELFake data does not contain a `label` column."
+    if "text_clean" in df.columns:
+        df["text_clean"] = df["text_clean"].fillna("").astype(str)
+    else:
+        df["text_clean"] = ""
 
-    df["label"] = pd.to_numeric(df["label"], errors="coerce")
-    df = df.dropna(subset=["label"]).copy()
-    df["label"] = df["label"].astype(int)
-    df["label_name"] = df["label"].map({1: "FAKE", 0: "REAL"}).fillna("UNKNOWN")
+    if "label_name" not in df.columns and "label" in df.columns:
+        df["label"] = pd.to_numeric(df["label"], errors="coerce")
+        df["label_name"] = df["label"].map({1: "FAKE", 0: "REAL"}).fillna("UNKNOWN")
 
-    df["title_clean"] = get_fallback_series(df, "title", "")
-    df["text_clean"] = df.apply(pick_best_text, axis=1)
-
-    # Structural features
-    df["title_word_count"] = df["title_clean"].apply(lambda x: len(str(x).split()))
-    df["text_word_count"] = df["text_clean"].apply(lambda x: len(str(x).split()))
-    df["char_count"] = df["text_clean"].apply(lambda x: len(str(x)))
-    df["bert_over_512_words"] = df["text_word_count"] > 512
-
-    def title_caps_ratio(text):
-        words = str(text).split()
-        if not words:
-            return 0.0
-        caps = sum(1 for w in words if w.isupper() and len(w) > 1)
-        return caps / len(words)
-
-    def punctuation_density(text):
-        txt = str(text)
-        words = txt.split()
-        if not words:
-            return 0.0
-        punct = len(re.findall(r"[!?;:,\-]", txt))
-        return punct / len(words)
-
-    def title_punct_density(text):
-        txt = str(text)
-        words = txt.split()
-        if not words:
-            return 0.0
-        punct = len(re.findall(r"[!?;:,\-]", txt))
-        return punct / len(words)
-
-    def lexical_diversity(text):
-        tokens = tokenize(text)
-        if not tokens:
-            return 0.0
-        return len(set(tokens)) / len(tokens)
-
-    def stopword_ratio(text):
-        tokens = tokenize(text)
-        if not tokens:
-            return 0.0
-        stop_ct = sum(1 for t in tokens if t in ENGLISH_STOP_WORDS)
-        return stop_ct / len(tokens)
-
-    def repeated_word_ratio(text):
-        tokens = tokenize(text)
-        if not tokens:
-            return 0.0
-        counts = Counter(tokens)
-        repeated = sum(c for c in counts.values() if c > 1)
-        return repeated / len(tokens)
-
-    def sentence_complexity(text):
-        txt = str(text).strip()
-        if not txt:
-            return 0.0
-        sentences = [s.strip() for s in re.split(r"[.!?]+", txt) if s.strip()]
-        words = txt.split()
-        return len(words) / len(sentences) if sentences else 0.0
-
-    df["title_caps_ratio"] = df["title_clean"].apply(title_caps_ratio)
-    df["title_punct_density"] = df["title_clean"].apply(title_punct_density)
-    df["lexical_diversity"] = df["text_clean"].apply(lexical_diversity)
-    df["stopword_ratio"] = df["text_clean"].apply(stopword_ratio)
-    df["repeated_word_ratio"] = df["text_clean"].apply(repeated_word_ratio)
-    df["sentence_complexity"] = df["text_clean"].apply(sentence_complexity)
-    df["punctuation_density"] = df["text_clean"].apply(punctuation_density)
-
-    # Force numeric columns to be safe for deployment plotting
     numeric_cols = [
         "title_word_count",
         "text_word_count",
@@ -295,27 +200,32 @@ def load_welfake_parts():
         "punctuation_density",
     ]
     for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Title signal flags
-    df["has_question_mark_title"] = df["title_clean"].str.contains(r"\?", regex=True, na=False)
-    df["has_exclamation_title"] = df["title_clean"].str.contains(r"!", regex=True, na=False)
-    df["title_all_caps_heavy"] = df["title_caps_ratio"] >= 0.30
+    # Recreate title flags if needed
+    if "has_question_mark_title" not in df.columns:
+        df["has_question_mark_title"] = df["title_clean"].str.contains(r"\?", regex=True, na=False)
 
-    warning_message = None
-    if failed_files:
-        warning_message = "Some files could not be loaded:\n" + "\n".join(failed_files)
+    if "has_exclamation_title" not in df.columns:
+        df["has_exclamation_title"] = df["title_clean"].str.contains(r"!", regex=True, na=False)
 
-    return df, warning_message
+    if "title_all_caps_heavy" not in df.columns:
+        if "title_caps_ratio" in df.columns:
+            df["title_all_caps_heavy"] = df["title_caps_ratio"] >= 0.30
+        else:
+            df["title_all_caps_heavy"] = False
+
+    return df, None
 
 
 # -----------------------------
 # Load data
 # -----------------------------
-df, load_warning = load_welfake_parts()
+df, load_warning = load_data()
 
 st.title("📰 Fake vs. Real News Analysis")
-st.caption("Interactive Streamlit app built from the split WELFake dataset.")
+st.caption("Interactive Streamlit app built from a processed WELFake deployment dataset.")
 
 if df is None:
     st.error(load_warning)
@@ -456,14 +366,14 @@ with tab1:
                 title="Class balance in the filtered view",
             )
             fig.update_traces(textposition="outside")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("Class balance chart could not be rendered for the current filter.")
 
     with right:
         summary_tbl = make_metric_table(analysis_df)
         if not summary_tbl.empty:
-            st.dataframe(summary_tbl, use_container_width=True, hide_index=True)
+            st.dataframe(summary_tbl, width="stretch", hide_index=True)
 
         st.markdown(
             """
@@ -522,7 +432,7 @@ with tab2:
                     marginal="box",
                     title="Distribution of article text length",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Text length histogram could not be rendered.")
 
@@ -534,10 +444,10 @@ with tab2:
                     y="sentence_complexity",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Sentence complexity by class",
                 )
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
             else:
                 st.warning("Sentence complexity plot could not be rendered.")
 
@@ -562,7 +472,7 @@ with tab2:
                     text="percent_over_512",
                 )
                 fig3.update_traces(texttemplate="%{text}%", textposition="outside")
-                st.plotly_chart(fig3, use_container_width=True)
+                st.plotly_chart(fig3, width="stretch")
             else:
                 st.warning("BERT pressure chart could not be rendered.")
 
@@ -578,7 +488,7 @@ with tab2:
                     hover_data=["title_clean"],
                     title="Text words vs character count",
                 )
-                st.plotly_chart(fig4, use_container_width=True)
+                st.plotly_chart(fig4, width="stretch")
             else:
                 st.warning("Character count scatterplot could not be rendered.")
 
@@ -599,10 +509,10 @@ with tab3:
                     y="lexical_diversity",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Lexical diversity",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Lexical diversity plot could not be rendered.")
 
@@ -614,10 +524,10 @@ with tab3:
                     y="repeated_word_ratio",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Repeated word ratio",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Repeated word ratio plot could not be rendered.")
 
@@ -630,10 +540,10 @@ with tab3:
                     y="stopword_ratio",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Stopword ratio",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Stopword ratio plot could not be rendered.")
 
@@ -645,10 +555,10 @@ with tab3:
                     y="punctuation_density",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Punctuation density",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Punctuation density plot could not be rendered.")
 
@@ -664,7 +574,7 @@ with tab3:
                 hover_data=["title_clean"],
                 title="Article length vs lexical diversity",
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("Lexical diversity scatterplot could not be rendered.")
 
@@ -685,10 +595,10 @@ with tab4:
                     y="title_word_count",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Headline word count",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Headline word count plot could not be rendered.")
 
@@ -700,10 +610,10 @@ with tab4:
                     y="title_caps_ratio",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Headline capitalization ratio",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Headline capitalization plot could not be rendered.")
 
@@ -735,7 +645,7 @@ with tab4:
                     barmode="group",
                     title="Share of titles with strong headline signals",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Headline signal bar chart could not be rendered.")
 
@@ -747,10 +657,10 @@ with tab4:
                     y="title_punct_density",
                     color="label_name",
                     color_discrete_map=COLOR_MAP,
-                    points="all",
+                    points=False,
                     title="Headline punctuation density",
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             else:
                 st.warning("Headline punctuation density plot could not be rendered.")
 
@@ -771,7 +681,7 @@ with tab5:
                 title="Most common REAL terms",
                 color_discrete_sequence=[ACCENT_GREEN],
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("No REAL terms available in the current filter.")
 
@@ -787,7 +697,7 @@ with tab5:
                 title="Most common FAKE terms",
                 color_discrete_sequence=[ACCENT_GOLD],
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         else:
             st.warning("No FAKE terms available in the current filter.")
 
@@ -810,7 +720,7 @@ with tab5:
         ].copy()
 
         st.write(f"Matches found: {len(hits):,}")
-        st.dataframe(hits.head(50), use_container_width=True, hide_index=True)
+        st.dataframe(hits.head(50), width="stretch", hide_index=True)
 
 with tab6:
     st.subheader("Article browser")
@@ -833,7 +743,7 @@ with tab6:
     )
 
     browser_df = filtered[selected_cols].copy() if selected_cols else filtered.copy()
-    st.dataframe(browser_df.head(200), use_container_width=True, hide_index=True)
+    st.dataframe(browser_df.head(200), width="stretch", hide_index=True)
 
     if len(filtered) > 0:
         inspect_index = st.number_input(
@@ -862,4 +772,4 @@ with tab6:
 
 if show_raw:
     st.subheader("Raw combined data preview")
-    st.dataframe(df.head(100), use_container_width=True, hide_index=True)
+    st.dataframe(df.head(100), width="stretch", hide_index=True)
